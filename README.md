@@ -1,9 +1,14 @@
-# Recovering data from a NETGEAR ReadyNAS NV+ (v1, SPARC) with a dead disk
+# Recovering data from a NETGEAR ReadyNAS NV+ (v1, SPARC) on Fedora
 
 A field-tested, read-only procedure for getting files off the original **Infrant / NETGEAR
 ReadyNAS NV+** (the SPARC-based model, RAIDiator 4.x) when the box is dead and one of the
-four disks is unreadable. Everything runs on an ordinary x86-64 Linux machine, works from
-raw disk images, and never writes a single byte to them.
+four disks is unreadable. Everything runs in a **Fedora** VM on an ordinary x86-64 host,
+works from raw disk images, and never writes a single byte to them.
+
+Fedora is used because its kernel (≥ 6.19) can mount the box's unusual 16 KiB-block ext3
+natively. On distributions with older kernels you're stuck with userspace `fuse2fs`, which
+was **~5× slower** in practice (16 vs 77 MB/s), the difference between a day and a week on
+a few terabytes.
 
 It was written after recovering ~4.4 TB / 145,000 files from a 4 × 2 TB X-RAID unit where
 one disk could only be imaged up to ~600 MB. Every file except three that were being
@@ -24,7 +29,7 @@ It covers two cases:
 ## Contents
 
 - [What is actually on the disks](#what-is-actually-on-the-disks)
-- [Requirements](#requirements)
+- [Set up the Fedora VM](#set-up-the-fedora-vm)
 - [All disks healthy – the short path](#all-disks-healthy--the-short-path)
 - [Step 0 – Image the disks](#step-0--image-the-disks)
 - [Step 1 – Attach the images read-only](#step-1--attach-the-images-read-only)
@@ -57,7 +62,7 @@ flowchart TD
   end
   NBD["nbdkit XOR plugin<br/>disk2 = disk1 ⊕ disk3 ⊕ disk4"]
   LVM["LVM2 · VG c · LV c<br/>linear: disk1 → disk2 → disk3"]
-  FS["ext3 · 16 KiB blocks<br/>mount -t ext4 -o ro,noload<br/>(kernel ≥ 6.19)"]
+  FS["ext3 · 16 KiB blocks<br/>mount -t ext4 -o ro,noload<br/>(Fedora kernel ≥ 6.19)"]
   OUT["rsync to new storage"]
   DBG["debugfs rdump<br/>(directories the kernel refuses)"]
 
@@ -78,7 +83,7 @@ flowchart TD
 | Partitions | MBR: p1 ≈ 2 GB OS (ext3, mirrored with no md superblock), p2 swap, p3 extended, **p5 data** (type `8e`) | All disks share the same layout, so one disk's offsets apply to all |
 | RAID | **Infrant's own X-RAID: no md at all.** Data disks are plain LVM PVs; the last disk is a **dedicated XOR parity disk** | `mdadm --examine` finds nothing. Any one disk can be rebuilt as the XOR of the others |
 | Volume | **LVM2 text-format** metadata (despite 2009-era firmware), VG `c`, one LV `c` laid out **linearly** across the data PVs | Modern `lvm2` reads it fine; no LVM1 tools needed |
-| Filesystem | **ext3 with a 16 KiB block size**, little-endian | x86 kernels before 6.19 cannot mount it; userspace tools can |
+| Filesystem | **ext3 with a 16 KiB block size**, little-endian | x86 kernels before 6.19 cannot mount it, hence Fedora |
 
 **Endianness:** the CPU was big-endian SPARC, but ext3 metadata is always little-endian on
 disk and LVM metadata is text, so an x86 host reads everything natively. Only md 0.90
@@ -90,24 +95,59 @@ superblocks would have been host-endian, and this unit doesn't use md.
 
 ---
 
-## Requirements
+## Set up the Fedora VM
 
-- An x86-64 Linux **VM** (not an LXC container; loop partitions need a real kernel).
-- For the fast path: **kernel 6.19 or newer**, which can mount ext4/ext3 with block size
-  larger than the page size. Fedora 44 ships one out of the box. Debian 13's stock 6.12 can't,
-  though it still works with the slower `fuse2fs` fallback.
-- Disk images reachable from the VM, e.g. over NFS (read-only mount recommended).
-- Somewhere to copy the recovered data to, at least as large as the used space on the volume.
+### Create the VM
 
-Packages (Fedora):
+- **Image:** latest Fedora (44 at the time of writing), *Everything* **Network Install**
+  ISO for x86_64. In the installer choose **Fedora Custom Operating System** (minimal); no
+  extra package groups are needed.
+- **Hardware:** 4 vCPU, 8 GB RAM, 20 GB disk. Nothing large is stored locally.
+- **Must be a VM**, not a container: loop devices with partitions and the `nbd` kernel
+  module need a real kernel.
+- Put it on a network that can reach the storage holding the images.
+
+### Update and check the kernel
 
 ```bash
-dnf install -y lvm2 nbdkit nbdkit-python-plugin nbd python3-numpy rsync tmux e2fsprogs
+sudo -i
+dnf upgrade -y && reboot
+uname -r            # must be 6.19 or newer
 ```
 
-Debian/Ubuntu equivalents: `lvm2 nbdkit nbdkit-plugin-python nbd-client python3-numpy rsync tmux e2fsprogs fuse2fs`.
+### Install the tools
 
-Clone this repo onto the VM, or copy the `scripts/` folder over.
+```bash
+dnf install -y lvm2 mdadm e2fsprogs nbdkit nbdkit-python-plugin nbd \
+               python3-numpy nfs-utils rsync tmux git ddrescue testdisk
+git clone https://github.com/viktormar1337/readynas-nvplus-recovery.git
+cd readynas-nvplus-recovery
+```
+
+### Two Fedora specifics
+
+- **LVM devices file.** Fedora's LVM only scans devices listed in
+  `/etc/lvm/devices/system.devices`, so it ignores loop and nbd devices. Every
+  `pvs`/`vgs`/`lvs`/`vgchange` in this guide therefore carries `--devicesfile ""`.
+- **SELinux.** If nbdkit or a mount is denied with permission errors that make no sense,
+  `setenforce 0` for the duration of the recovery.
+
+### Make the images available
+
+Over NFS, mount the image share **read-only**, and the destination separately read-write:
+
+```bash
+mkdir -p /mnt/images /mnt/dest
+mount -t nfs -o ro  nas.example:/export/images /mnt/images
+mount -t nfs        nas.example:/export/dest   /mnt/dest
+IMG=/mnt/images
+```
+
+On ZFS-based NAS systems (TrueNAS etc.), child datasets are **not** visible through a
+parent's NFS export. They show up as empty directories. Export the dataset that actually
+contains the images.
+
+You need free space at the destination at least equal to the used space on the old volume.
 
 ---
 
@@ -117,7 +157,6 @@ If every disk images cleanly, nothing needs reconstructing. The parity disk isn'
 the LVM volume at all, so you simply attach the **data** disks and skip steps 3–4.
 
 ```bash
-IMG=/path/to/images
 losetup -rP --find --show $IMG/disk1.img
 losetup -rP --find --show $IMG/disk2.img
 losetup -rP --find --show $IMG/disk3.img
@@ -148,8 +187,9 @@ you can switch to the rebuild path for that disk and get those areas back from p
 
 ## Step 0 – Image the disks
 
-Work from images, never the original drives. Pull the disks, connect them to any Linux box
-and image each one with `ddrescue` (a mapfile lets you resume and retry bad areas):
+Work from images, never the original drives. Pull the disks, connect them to the Fedora
+host (or any Linux box) and image each one with `ddrescue`; a mapfile lets you resume and
+retry bad areas:
 
 ```bash
 ddrescue -n    /dev/sdX disk1.img disk1.map   # fast pass
@@ -165,7 +205,6 @@ for assembly but worth keeping.
 ## Step 1 – Attach the images read-only
 
 ```bash
-IMG=/path/to/images
 losetup -rP --find --show $IMG/disk1.img    # -r read-only, -P scan partitions
 losetup -rP --find --show $IMG/disk3.img
 lsblk -o NAME,SIZE,RO,PTTYPE
@@ -185,8 +224,9 @@ others' MBRs and no longer parses. You don't need to attach it as a loop device 
 fdisk -l /dev/loop0
 blkid /dev/loop0p*
 mdadm --examine /dev/loop0p5         # expect: "No md superblock detected"
-pvs; vgs
-lvs -a -o lv_name,vg_name,lv_size,segtype,devices
+pvs --devicesfile ""
+vgs --devicesfile ""
+lvs --devicesfile "" -a -o lv_name,vg_name,lv_size,segtype,devices
 ```
 
 Note the **start sector and length of p5** from `fdisk`. On the unit tested here they were
@@ -247,6 +287,13 @@ nbd-client -b 512 localhost /dev/nbd0
 blkid /dev/nbd0      # LVM2_member, UUID = the missing PV
 ```
 
+`nbd-client` prints a warning about the oldstyle protocol; it's harmless. If `nbd-client -c
+/dev/nbd0` still says disconnected, use `qemu-nbd` instead (`dnf install -y qemu-img`):
+
+```bash
+qemu-nbd --connect=/dev/nbd0 --read-only nbd://localhost:10809
+```
+
 The plugin reads the three sources in parallel, XORs them with numpy and prefetches when
 reads are sequential. Measured at ~190 MB/s raw on 10 GbE NFS.
 
@@ -257,8 +304,8 @@ permanent copy:
 
 ```bash
 ./scripts/make-missing-disk.py --offset 4608003 --size 3902384303 \
-  --out /dest/disk2-p5.img $IMG/disk1.img $IMG/disk3.img $IMG/disk4.img
-losetup -r --find --show /dest/disk2-p5.img
+  --out /mnt/dest/disk2-p5.img $IMG/disk1.img $IMG/disk3.img $IMG/disk4.img
+losetup -r --find --show /mnt/dest/disk2-p5.img
 ```
 
 Resumable: rerun the same command after an interruption.
@@ -268,13 +315,11 @@ Resumable: rerun the same command after an interruption.
 ## Step 5 – Activate LVM read-only
 
 ```bash
-pvs                    # all PVs present, no [unknown]
-vgchange -ay --config 'activation { read_only_volume_list = [ "c/c" ] }' c
-lvs -o lv_name,lv_attr c          # attr must contain 'r'
+pvs --devicesfile ""                 # all PVs present, no [unknown]
+vgchange -ay --devicesfile "" \
+  --config 'activation { read_only_volume_list = [ "c/c" ] }' c
+lvs --devicesfile "" -o lv_name,lv_attr c     # attr must contain 'r'
 ```
-
-**Fedora:** LVM only looks at devices listed in `/etc/lvm/devices/system.devices`, so loop
-and nbd devices are ignored. Add `--devicesfile ""` to `pvs` and `vgchange`.
 
 Raise readahead. It helps a lot over network storage:
 
@@ -296,30 +341,19 @@ dumpe2fs -h /dev/c/c | grep -Ei 'block size|features|state'
 If `needs_recovery` is **not** in the features list, there is nothing in the journal to
 replay.
 
-### Fast path – kernel ≥ 6.19
-
 ```bash
 mkdir -p /mnt/readynas
 mount -t ext4 -o ro,noload /dev/c/c /mnt/readynas
+dmesg | tail -5
+ls /mnt/readynas
 ```
 
-`noload` skips the journal. That's safe when `needs_recovery` isn't set.
-
-### Fallback – fuse2fs (any kernel)
+`noload` skips the journal. That's safe when `needs_recovery` isn't set. Expect roughly
+70–80 MB/s on large files over 10 GbE NFS, measured with:
 
 ```bash
-fuse2fs /dev/c/c /mnt/readynas -o ro,force
+dd if="/mnt/readynas/some/large/file" of=/dev/null bs=1M count=512 status=progress
 ```
-
-Works everywhere, but reads one block at a time. Measured on the same file:
-
-| Method | Throughput |
-|---|---|
-| `fuse2fs` | 16 MB/s |
-| kernel `mount -t ext4` (6.19+) | 77 MB/s |
-
-On 4+ TB that's the difference between a week and a day, which is worth spinning up a
-Fedora VM for.
 
 If the journal *does* need replaying, do it on a copy-on-write overlay so the images stay
 untouched:
@@ -356,7 +390,7 @@ Run it in `tmux`; it takes a while.
 
 ```bash
 rsync -rltH --info=progress2 --partial --ignore-errors \
-  /mnt/readynas/ /dest/recovered/ 2>&1 | tee rsync.log
+  /mnt/readynas/ /mnt/dest/recovered/ 2>&1 | tee rsync.log
 ```
 
 `-rltH` copies content, symlinks, timestamps and hard links, but not owners, permissions,
@@ -372,7 +406,7 @@ grep -iE 'error|failed' rsync.log | grep -v 'failed to set permissions'
 The command is resumable. Verify completeness with a dry run when it's done:
 
 ```bash
-rsync -rltHn --stats /mnt/readynas/ /dest/recovered/ | grep 'files transferred'
+rsync -rltHn --stats /mnt/readynas/ /mnt/dest/recovered/ | grep 'files transferred'
 ```
 
 ---
@@ -392,7 +426,7 @@ case-insensitive directory and refuses to open on a filesystem without that feat
 data is fine. `debugfs` doesn't care about the flag:
 
 ```bash
-debugfs -c -R 'rdump "/path/to/dir" /dest/recovered-debugfs/parent' /dev/c/c
+debugfs -c -R 'rdump "/path/to/dir" /mnt/dest/recovered-debugfs/parent' /dev/c/c
 ```
 
 (`Operation not permitted while setting permissions` messages are the same ACL noise as
@@ -411,7 +445,7 @@ debugfs -c -R 'stat <inode>' /dev/c/c
 If `stat` shows size 0, no blocks and a 1970 timestamp, there's no metadata left to follow.
 You can try carving with `photorec` on the region after the last successfully written file
 in the same directory (`debugfs -R 'blocks <inode>'` gives its blocks, a 16 KiB block group
-holds 131072 blocks), but don't expect much. The data most likely never reached the disk.
+holds 131072 blocks; `photorec` is in the `testdisk` package), but don't expect much. The data most likely never reached the disk.
 
 ---
 
@@ -419,10 +453,11 @@ holds 131072 blocks), but don't expect much. The data most likely never reached 
 
 ```bash
 umount /mnt/readynas
-vgchange -an c                 # Fedora: add --devicesfile ""
-nbd-client -d /dev/nbd0
+vgchange -an --devicesfile "" c
+nbd-client -d /dev/nbd0          # or: qemu-nbd --disconnect /dev/nbd0
 pkill nbdkit
 losetup -D
+umount /mnt/dest /mnt/images
 ```
 
 Keep the images of all surviving disks until you've checked the copy. Without them the
@@ -436,13 +471,13 @@ missing disk can't be rebuilt again.
 |---|---|---|
 | `mount.nfs: failed to apply fstab options` | Not root | `sudo -i` |
 | NFS share shows empty subdirectories | ZFS child datasets aren't exported through the parent | Export the child dataset itself |
-| `Can't lookup blockdev` on mount | VG not activated (Fedora devices file) | `vgchange ... --devicesfile ""` |
+| `pvs` doesn't see loop/nbd PVs | Fedora LVM devices file | Add `--devicesfile ""` |
+| `Can't lookup blockdev` on mount | VG not activated | `vgchange -ay --devicesfile "" ...` |
+| nbdkit or mount denied for no obvious reason | SELinux | `setenforce 0` |
+| `uname -r` older than 6.19 | VM not updated | `dnf upgrade -y && reboot` |
 | `blkid /dev/nbd0` empty | nbd-client not connected | `nbd-client -c /dev/nbd0`; reconnect; or `qemu-nbd --connect=/dev/nbd0 --read-only nbd://localhost:10809` |
-| fuse2fs wants `force` | `state: not clean` after crash | Fine if `needs_recovery` isn't set |
-| Copy stuck at 3–6 MB/s | fuse2fs is the bottleneck | Use a ≥ 6.19 kernel and mount natively |
 | `nbdkit` at 100 % CPU, fsck/rsync slow | Prefetch reading far more than consumed | Compare `rchar` in `/proc/$(pidof nbdkit)/io` with the consumer's `read_bytes`. Should be ~3× |
 | rsync `--chown` has no effect | `--chown` requires `-o -g` | Use `-rltHog --chown=UID:GID` |
-| Backports kernel fails with unsatisfiable `linux-base-…` deps | Incomplete backports mirror | Use a distro that ships ≥ 6.19 (Fedora 44) |
 
 ---
 
@@ -452,7 +487,7 @@ missing disk can't be rebuilt again.
 - **Assuming LVM1.** The metadata is LVM2 text format; current lvm2 reads it directly.
 - **Assembling with the partial image of the dead disk.** It would be treated as a full member and inject zeros. Leave it out and rebuild from parity.
 - **Generic "nearby read = sequential" prefetch heuristics** in the XOR layer: fsck's scattered reads triggered ~2000× read amplification. The plugin here only prefetches after consecutive forward reads.
-- **Tuning fuse2fs.** It processes one request at a time and is capped at ~15–20 MB/s regardless. Upgrade the kernel instead.
+- **Older distributions with fuse2fs.** Debian 13 (kernel 6.12) can only read the volume through `fuse2fs`, which handles one request at a time and topped out at ~16 MB/s. Debian's backports kernel wasn't installable at the time. That's why this guide is Fedora-only.
 
 ---
 
